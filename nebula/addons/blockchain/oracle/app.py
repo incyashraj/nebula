@@ -1,6 +1,9 @@
 import json
+import logging
 import os
+import random
 from collections.abc import Mapping
+from datetime import datetime
 from functools import wraps
 
 import requests
@@ -58,6 +61,30 @@ class Oracle:
 
         # create Web3 object for making transactions
         self.__web3 = self.__initialize_web3()
+
+        self.__aggregation_mode = "decentralized"
+        self.__central_node = None
+        self.__mode_history = []
+
+        # Add client status storage
+        self.__client_status = {}  # Store client statuses
+        self.__active_clients = set()  # Track active clients
+        self.__inactive_timeout = 600  # 60 seconds timeout
+
+        self.__model_registry = {}  # Store model versions
+        self.__global_version = 0  # Track global model version
+
+        self.__performance_threshold = 0.8
+        self.__performance_history = {}
+
+        self.__model_states = {}  # Add this line
+
+        self.__benchmark_data = {}
+        self.__optimization_thresholds = {
+            "convergence_rate": 0.001,  # Minimum improvement rate
+            "communication_overhead": 1000,  # Maximum bytes
+            "aggregation_time": 60,  # Maximum seconds
+        }
 
         # create a Web3 contract object from the compiled chaincode
         self.contract_obj = self.__compile_chaincode()
@@ -377,6 +404,215 @@ class Oracle:
         """
         return self.__ready
 
+    def is_client_active(self, last_seen_str):
+        """Check if client is still active based on last_seen time"""
+        try:
+            last_seen = datetime.fromisoformat(last_seen_str)
+            time_since_update = (datetime.now() - last_seen).total_seconds()
+            is_active = time_since_update < self.__inactive_timeout
+            logging.info(
+                f"Checking active status: last_seen={last_seen_str}, time_since_update={time_since_update}, timeout={self.__inactive_timeout}, is_active={is_active}"
+            )
+            return is_active
+        except Exception as e:
+            logging.exception(f"Error checking client active status: {e}")
+            return False
+
+    def update_client_status(self, status_data):
+        """Update and store client status"""
+        client_id = status_data["client_id"]
+        try:
+            current_time = datetime.now()
+            last_seen = datetime.fromisoformat(status_data["last_seen"])
+            time_since_update = (current_time - last_seen).total_seconds()
+
+            # Mark active if seen in last 5 minutes
+            status_data["active"] = time_since_update < self.__inactive_timeout
+            if status_data["active"]:
+                self.__active_clients.add(client_id)
+            else:
+                self.__active_clients.discard(client_id)
+
+            self.__client_status[client_id] = status_data
+
+            print(
+                f"Client {client_id}: last_seen={last_seen}, time_since={time_since_update}s, active={status_data['active']}"
+            )
+
+            return {
+                "total_clients": len(self.__client_status),
+                "active_clients": len(self.__active_clients),
+                "time_since_update": time_since_update,
+            }
+        except Exception as e:
+            print(f"Error updating client status: {e}")
+            return None
+
+    def get_active_clients(self):
+        """Get list of currently active clients"""
+        return list(self.__active_clients)
+
+    def get_all_client_status(self):
+        """Get status of all clients, updating active status"""
+        for client_id, status in self.__client_status.items():
+            if not self.is_client_active(status["last_seen"]):
+                status["active"] = False
+                self.__active_clients.discard(client_id)
+            else:
+                status["active"] = True
+                self.__active_clients.add(client_id)
+        return self.__client_status
+
+    def select_clients(self, num_clients=None, selection_criteria="random"):
+        """Select eligible clients for training round"""
+        active_clients = list(self.__active_clients)
+
+        if not active_clients:
+            return []
+
+        if not num_clients:
+            num_clients = len(active_clients)
+
+        # Get latest statuses
+        client_statuses = self.get_all_client_status()
+
+        # Filter based on criteria
+        eligible_clients = []
+        for client in active_clients:
+            status = client_statuses.get(client, {})
+            # Basic eligibility checks
+            if status.get("active") and status.get("uptime_seconds", 0) > 30:
+                eligible_clients.append(client)
+
+        # Select clients based on strategy
+        if selection_criteria == "random":
+            return random.sample(eligible_clients, min(num_clients, len(eligible_clients)))
+        elif selection_criteria == "reputation":
+            # Sort by gas usage as simple reputation metric
+            sorted_clients = sorted(eligible_clients, key=lambda x: client_statuses[x].get("gas_used", 0))
+            return sorted_clients[:num_clients]
+
+        return eligible_clients[:num_clients]
+
+    def register_model_version(self, data):
+        """
+        Register a model version
+        data = {
+            'client_id': str,
+            'local_version': int,
+            'global_version': int,
+            'timestamp': str,
+            'performance': float
+        }
+        """
+        client_id = data["client_id"]
+        if client_id not in self.__model_registry:
+            self.__model_registry[client_id] = []
+        self.__model_registry[client_id].append(data)
+        return {"status": "success", "global_version": self.__global_version}
+
+    def get_model_versions(self, client_id):
+        return {"versions": self.__model_registry.get(client_id, []), "current_global": self.__global_version}
+
+    def update_global_version(self):
+        self.__global_version += 1
+        return self.__global_version
+
+    def check_model_performance(self, client_id, performance):
+        """Monitor model performance and detect degradation"""
+        if client_id not in self.__performance_history:
+            self.__performance_history[client_id] = []
+
+        self.__performance_history[client_id].append(performance)
+
+        # Check for degradation
+        if len(self.__performance_history[client_id]) >= 3:
+            recent = self.__performance_history[client_id][-3:]
+            if all(p < self.__performance_threshold for p in recent):
+                return True
+        return False
+
+    def trigger_model_replacement(self, client_id):
+        """Trigger new training when performance drops"""
+        logging.info(f"Triggering model replacement for {client_id}")
+        self.__global_version += 1
+        return {"new_version": self.__global_version}
+
+    def get_latest_model_version(self):
+        """Get latest model state"""
+        return {
+            "version": self.__global_version,
+            "performance_threshold": self.__performance_threshold,
+            "active_clients": len(self.__active_clients),
+        }
+
+    def get_model_state(self, version):
+        return self.__model_states.get(str(version))
+
+    def update_model_state(self, data):
+        version = str(data["version"])
+        self.__model_states[version] = data["state"]
+        return {"version": version}
+
+    def handle_model_update(self, client_id, model_state, performance):
+        """Handle model update with version control"""
+        needs_replacement = self.check_model_performance(client_id, performance)
+        if needs_replacement:
+            new_version = self.trigger_model_replacement(client_id)
+            self.update_model_state({"version": new_version, "state": model_state})
+
+    def store_benchmark_data(self, client_id, data):
+        """Store benchmark data from clients"""
+        if client_id not in self.__benchmark_data:
+            self.__benchmark_data[client_id] = []
+        self.__benchmark_data[client_id].append(data)
+
+        return self.optimize_parameters(client_id)
+
+    def optimize_parameters(self, client_id):
+        """Optimize based on benchmark data"""
+        if not self.__benchmark_data.get(client_id):
+            return {}
+
+        recent_data = self.__benchmark_data[client_id][-5:]  # Last 5 rounds
+
+        # Calculate optimization metrics
+        avg_convergence = sum(d["convergence_rate"] for d in recent_data) / len(recent_data)
+        avg_overhead = sum(d["communication_overhead"] for d in recent_data) / len(recent_data)
+
+        # Return optimization suggestions
+        return {
+            "optimize_batch_size": avg_overhead > self.__optimization_thresholds["communication_overhead"],
+            "adjust_learning_rate": avg_convergence < self.__optimization_thresholds["convergence_rate"],
+        }
+
+    def get_optimization_history(self, client_id):
+        """Get optimization history for a client"""
+        return {
+            "benchmark_data": self.__benchmark_data.get(client_id, []),
+            "optimization_thresholds": self.__optimization_thresholds,
+            "total_optimizations": len(self.__benchmark_data.get(client_id, [])),
+        }
+
+    def update_aggregation_mode(self, data):
+        """Update system aggregation mode"""
+        mode = data.get("mode")
+        central_node = data.get("central_node")
+
+        if mode not in ["centralized", "decentralized"]:
+            return {"error": "Invalid mode"}
+
+        self.__aggregation_mode = mode
+        self.__central_node = central_node if mode == "centralized" else None
+
+        self.__mode_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "mode": mode,
+            "central_node": central_node,
+        })
+
+        return {"mode": self.__aggregation_mode, "central_node": self.__central_node}
+
 
 @app.route("/")
 @error_handler
@@ -463,6 +699,104 @@ def rest_report_reputation():
 @error_handler
 def rest_get_reputation_timeseries():
     return oracle.reputation_store
+
+
+@app.route("/client_status", methods=["GET"])
+@error_handler
+def rest_get_client_status():
+    logging.info("Client status request received")
+    logging.info(f"Current client status: {oracle.get_all_client_status()}")
+    return jsonify(oracle.get_all_client_status())
+
+
+@app.route("/client_status", methods=["POST"])
+@error_handler
+def rest_report_client_status():
+    status_data = request.get_json()
+    logging.info(f"Received status update: {status_data}")
+    response = oracle.update_client_status(status_data)
+    return jsonify({"Message": "Client status updated", "data": response})
+
+
+@app.route("/active_clients", methods=["GET"])
+@error_handler
+def rest_get_active_clients():
+    return jsonify(oracle.get_active_clients())
+
+
+@app.route("/select_clients", methods=["GET"])
+@error_handler
+def rest_select_clients():
+    num_clients = request.args.get("num_clients", type=int)
+    criteria = request.args.get("criteria", "random")
+    selected = oracle.select_clients(num_clients, criteria)
+    return jsonify(selected)
+
+
+@app.route("/model/version", methods=["POST"])
+@error_handler
+def register_model_version():
+    data = request.get_json()
+    return jsonify(oracle.register_model_version(data))
+
+
+@app.route("/model/versions/<client_id>", methods=["GET"])
+@error_handler
+def get_model_versions(client_id):
+    return jsonify(oracle.get_model_versions(client_id))
+
+
+@app.route("/model/performance", methods=["POST"])
+@error_handler
+def check_performance():
+    data = request.get_json()
+    needs_replacement = oracle.check_model_performance(data["client_id"], data["performance"])
+    if needs_replacement:
+        return jsonify(oracle.trigger_model_replacement(data["client_id"]))
+    return jsonify({"replace_model": False})
+
+
+@app.route("/model/state/<version>", methods=["GET"])
+@error_handler
+def get_model_state(version):
+    return jsonify(oracle.get_model_state(version))
+
+
+@app.route("/model/state", methods=["POST"])
+@error_handler
+def update_model_state():
+    data = request.get_json()
+    return jsonify(oracle.update_model_state(data))
+
+
+@app.route("/optimization/benchmark", methods=["POST"])
+@error_handler
+def store_benchmark():
+    data = request.get_json()
+    return jsonify(oracle.store_benchmark_data(data["client_id"], data["metrics"]))
+
+
+@app.route("/optimization/history/<client_id>", methods=["GET"])
+@error_handler
+def get_optimization_history(client_id):
+    return jsonify(oracle.get_optimization_history(client_id))
+
+
+@app.route("/mode", methods=["POST"])
+@error_handler
+def update_mode():
+    data = request.get_json()
+    return jsonify(oracle.update_aggregation_mode(data))
+
+
+@app.route("/mode", methods=["GET"])
+@error_handler
+def get_mode():
+    return jsonify({
+        "mode": oracle._Oracle__aggregation_mode,  # Access private attribute properly
+        "central_node": oracle._Oracle__central_node,
+        "history": oracle._Oracle__mode_history,
+    })
 
 
 if __name__ == "__main__":

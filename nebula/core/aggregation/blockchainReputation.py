@@ -1,6 +1,9 @@
+import asyncio
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
+from datetime import datetime
 
 import requests
 import torch
@@ -242,6 +245,19 @@ class BlockchainHandler:
 
         # configure web3 objects for using Proof-of-Authority
         self.__web3 = self.__initialize_web3()
+
+        # Add basic status tracking
+        self.status = {"active": False, "join_time": None, "last_seen": None}
+
+        self.__last_status_update = datetime.now()
+        self.__status_update_interval = 10  # Status update every 30 seconds
+        self.__register_periodic_status_update()
+
+        self.__optimization_metrics = {"convergence_rate": 0, "communication_overhead": 0, "aggregation_time": 0}
+        self.__benchmark_data = []
+
+        self.__aggregation_mode = "decentralized"  # or "centralized"
+        self.__central_node = None
 
         # call Oracle to sense if blockchain is ready
         print(f"{'-' * 25} CONNECT TO ORACLE {'-' * 25}", flush=True)
@@ -498,6 +514,11 @@ class BlockchainHandler:
 
         """
 
+        if self.__should_update_status():
+            self.update_status()
+            self.report_status_to_oracle()
+            self.__last_status_update = datetime.now()
+
         # create raw transaction object to call rate_neighbors() from the reputation system
         unsigned_trx = self.__contract_obj.functions.rate_neighbours(list(opinion_dict.items())).build_transaction({
             "chainId": self.__web3.eth.chain_id,
@@ -525,6 +546,11 @@ class BlockchainHandler:
         Returns: Dictionary of name:reputation from the reputation system
 
         """
+
+        if self.__should_update_status():
+            self.update_status()
+            self.report_status_to_oracle()
+            self.__last_status_update = datetime.now()
 
         final_reputations = dict()
         stats_to_print = list()
@@ -613,6 +639,10 @@ class BlockchainHandler:
             "gasPrice": self.__web3.to_wei(self.__gas_price, "gwei"),
         })
 
+        self.status["active"] = True
+        self.status["join_time"] = datetime.now()
+        self.status["last_seen"] = datetime.now()
+
         # sign and execute created transaction
         conf = self.__sign_and_deploy(unsigned_trx)
 
@@ -639,6 +669,9 @@ class BlockchainHandler:
             # raise Exception to check again
             raise Exception("EXCEPTION: _verify_registration() => Could not be confirmed)")
 
+        # Report initial status after successful registration
+        self.report_status_to_oracle()
+
         return None
 
     @retry((Exception, requests.exceptions.HTTPError), tries=3, delay=4)
@@ -663,3 +696,301 @@ class BlockchainHandler:
         # increase aggregation round counter after reporting time
         self.round += 1
         return None
+
+    def update_status(self):
+        """Update client's last seen timestamp"""
+        current_time = datetime.now()
+        self.status["last_seen"] = current_time
+        logging.info(f"Status updated - Last seen: {current_time.isoformat()}")
+
+    def is_active(self):
+        """Check if client is still active based on last_seen"""
+        if not self.status["last_seen"]:
+            return False
+        # Consider client inactive if not seen in last 60 seconds
+        return (datetime.now() - self.status["last_seen"]).total_seconds() < 60
+
+    def get_status_report(self):
+        """Get comprehensive status report for client"""
+        current_time = datetime.now()
+        uptime = None
+        if self.status["join_time"]:
+            uptime = (current_time - self.status["join_time"]).total_seconds()
+
+        return {
+            "client_id": self.__home_ip,
+            "active": self.is_active(),
+            "join_time": self.status["join_time"].isoformat() if self.status["join_time"] else None,
+            "last_seen": self.status["last_seen"].isoformat() if self.status["last_seen"] else None,
+            "uptime_seconds": uptime,
+            "gas_used": self.__gas_used,  # Using existing gas tracking
+            "aggregation_round": self.round,  # Using existing round tracking
+        }
+
+    def report_status_to_oracle(self):
+        """Report client status to Oracle"""
+        try:
+            status_data = self.get_status_report()
+            logging.info(f"Sending status update to Oracle: {status_data}")
+            response = requests.post(
+                url=f"{self.__oracle_url}/client_status", json=status_data, headers=self.__rest_header, timeout=20
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.exception(f"Failed to report status to Oracle: {e}")
+            return None
+
+    def __should_update_status(self):
+        """Check if it's time for a status update"""
+        now = datetime.now()
+        time_since_update = (now - self.__last_status_update).total_seconds()
+        should_update = time_since_update >= self.__status_update_interval
+        if should_update:
+            logging.info(f"Time for status update. Time since last update: {time_since_update}s")
+        return should_update
+
+    def __register_periodic_status_update(self):
+        """Register the periodic status update task"""
+        asyncio.create_task(self.__periodic_status_update())
+
+    async def __periodic_status_update(self):
+        """Periodic task to update status"""
+        while True:
+            try:
+                if self.__should_update_status():
+                    logging.info("Performing periodic status update")
+                    self.update_status()
+                    self.report_status_to_oracle()
+                    self.__last_status_update = datetime.now()
+            except Exception as e:
+                logging.exception(f"Error in periodic status update: {e}")
+            await asyncio.sleep(5)  # Check every 5 seconds
+
+    def get_selected_clients(self, num_clients=None, criteria="random"):
+        """Get selected clients for current round"""
+        try:
+            params = {"num_clients": num_clients, "criteria": criteria}
+            response = requests.get(
+                url=f"{self.__oracle_url}/select_clients", params=params, headers=self.__rest_header, timeout=20
+            )
+            return response.json()
+        except Exception as e:
+            logging.exception(f"Error getting selected clients: {e}")
+            return []
+
+    def track_model_version(self):
+        data = {
+            "client_id": self.__home_ip,
+            "local_version": self.round,
+            "global_version": self.__global_version,
+            "timestamp": datetime.now().isoformat(),
+            "performance": self.__latest_performance,
+        }
+        try:
+            response = requests.post(url=f"{self.__oracle_url}/model/version", json=data, headers=self.__rest_header)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.exception(f"Failed to track model version: {e}")
+            return None
+
+    def check_performance_and_replace(self, current_performance):
+        try:
+            # Report performance to Oracle
+            data = {"client_id": self.__home_ip, "performance": current_performance}
+            response = requests.post(f"{self.__oracle_url}/model/performance", json=data, headers=self.__rest_header)
+
+            if response.json().get("replace_model", False):
+                self.handle_model_replacement()
+
+        except Exception as e:
+            logging.exception(f"Performance check failed: {e}")
+
+    def handle_model_replacement(self):
+        logging.info("Starting model replacement")
+        self.__global_version += 1
+        # Trigger retraining
+
+    def sync_model_versions(self):
+        """Sync local and global model versions"""
+        try:
+            response = requests.get(f"{self.__oracle_url}/model/versions/{self.__home_ip}", headers=self.__rest_header)
+            versions = response.json()
+            if versions["current_global"] > self.__global_version:
+                logging.info(f"New global version available: {versions['current_global']}")
+                return self.handle_model_replacement()
+            return False
+        except Exception as e:
+            logging.exception(f"Version sync failed: {e}")
+            return False
+
+    def get_model_state(self, version):
+        """Get model state from oracle"""
+        try:
+            response = requests.get(f"{self.__oracle_url}/model/state/{version}", headers=self.__rest_header)
+            return response.json().get("model_state")
+        except Exception as e:
+            logging.exception(f"Failed to get model state: {e}")
+            return None
+
+    def sync_model_state(self):
+        """Sync model state with latest version"""
+        latest = self.get_latest_model_version()
+        if latest["version"] > self.__global_version:
+            model_state = self.get_model_state(latest["version"])
+            if model_state:
+                self.__current_model = model_state
+                self.__global_version = latest["version"]
+                return True
+        return False
+
+    async def aggregate_with_version_sync(self):
+        """Aggregation with version syncing"""
+        if await self.sync_model_state():
+            logging.info("Model state updated, restarting training")
+            return True
+
+        performance = await self.calculate_performance()
+        if performance < self.__performance_threshold:
+            await self.check_performance_and_replace(performance)
+
+        await self.track_model_version()
+        return False
+
+    def optimize_aggregation(self):
+        """Adjust aggregation parameters based on benchmarks"""
+        try:
+            # Get optimization suggestions from Oracle
+            response = requests.post(
+                f"{self.__oracle_url}/optimization/benchmark",
+                json={"client_id": self.__home_ip, "metrics": self.__optimization_metrics},
+                headers=self.__rest_header,
+            )
+
+            suggestions = response.json()
+
+            if suggestions.get("optimize_batch_size"):
+                self.__adjust_batch_size()
+
+            if suggestions.get("adjust_learning_rate"):
+                self.__adjust_learning_rate()
+
+            return suggestions
+
+        except Exception as e:
+            logging.exception(f"Optimization failed: {e}")
+            return {}
+
+    def __adjust_batch_size(self):
+        """Adjust batch size based on communication overhead"""
+        current_overhead = self.__optimization_metrics["communication_overhead"]
+        if current_overhead > 1000:  # threshold
+            self.__batch_size = max(32, self.__batch_size // 2)
+        else:
+            self.__batch_size = min(256, self.__batch_size * 2)
+
+    def __adjust_learning_rate(self):
+        """Adjust learning rate based on convergence"""
+        current_rate = self.__optimization_metrics["convergence_rate"]
+        if current_rate < 0.001:  # threshold
+            self.__learning_rate *= 1.5
+        else:
+            self.__learning_rate *= 0.8
+
+    async def optimized_aggregation(self):
+        """Perform aggregation with optimization"""
+        start_time = time.time()
+
+        try:
+            # Regular aggregation
+            result = await self.aggregate_with_version_sync()
+
+            # Update metrics
+            self.__optimization_metrics.update({
+                "aggregation_time": time.time() - start_time,
+                "convergence_rate": self._calculate_convergence_rate(),
+                "communication_overhead": self._calculate_communication_overhead(),
+            })
+
+            # Benchmark and optimize
+            await self.benchmark_performance()
+            optimization_result = self.optimize_aggregation()
+
+            logging.info(f"Optimization metrics: {self.__optimization_metrics}")
+            logging.info(f"Optimization suggestions: {optimization_result}")
+
+            return result
+
+        except Exception as e:
+            logging.exception(f"Optimized aggregation failed: {e}")
+            return False
+
+    def _calculate_convergence_rate(self):
+        """Calculate convergence rate from recent rounds"""
+        if len(self.__benchmark_data) < 2:
+            return 0
+
+        recent = self.__benchmark_data[-2:]
+        return abs(recent[1].get("performance", 0) - recent[0].get("performance", 0))
+
+    def _calculate_communication_overhead(self):
+        """Calculate communication overhead"""
+        return sum(len(str(d)) for d in self.__benchmark_data[-1:])  # Simple estimation
+
+    async def set_aggregation_mode(self, mode, central_node=None):
+        """Switch between centralized and decentralized modes"""
+        if mode not in ["centralized", "decentralized"]:
+            logging.error(f"Invalid aggregation mode: {mode}")
+            return False
+
+        self.__aggregation_mode = mode
+        self.__central_node = central_node
+
+        # Update Oracle about mode change
+        await self.report_mode_change(mode)
+        return True
+
+    async def optimized_aggregation(self):
+        """Updated aggregation with mode awareness"""
+        if self.__aggregation_mode == "centralized":
+            return await self._centralized_aggregation()
+        else:
+            return await self._decentralized_aggregation()
+
+    async def _centralized_aggregation(self):
+        """Centralized aggregation mode"""
+        try:
+            if self.__central_node:
+                # If this is central node
+                if self.__home_ip == self.__central_node:
+                    logging.info("Acting as central aggregator")
+                    # Collect models from all nodes
+                    models = await self._collect_models()
+                    # Aggregate
+                    return await self._aggregate_models(models)
+                else:
+                    # Send model to central node
+                    logging.info(f"Sending model to central node: {self.__central_node}")
+                    return await self._send_model_to_central()
+        except Exception as e:
+            logging.exception(f"Centralized aggregation failed: {e}")
+            return False
+
+    async def _decentralized_aggregation(self):
+        """Decentralized aggregation mode"""
+        try:
+            # Get active neighbors
+            active_nodes = await self.get_active_nodes()
+            if not active_nodes:
+                logging.warning("No active nodes for decentralized aggregation")
+                return False
+
+            # Exchange models with neighbors
+            neighbor_models = await self._exchange_models(active_nodes)
+
+            # Local aggregation
+            return await self._aggregate_models(neighbor_models)
+        except Exception as e:
+            logging.exception(f"Decentralized aggregation failed: {e}")
+            return False
